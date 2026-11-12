@@ -1,30 +1,95 @@
-import os
+from datetime import datetime, timedelta, timezone
+import threading
 import time
-from datetime import datetime
-import openpyxl
-from openpyxl.styles import Alignment, Font, PatternFill
+import gspread
 import pandas as pd
 import requests
+import streamlit as st
 
 # ==============================================================================
-# SECTION 1: CONFIGURATION & SETTINGS
-# Kaam: Yahan aap Asset (BTC/ETH), Expiry Date aur API ka Base URL set karte hain.
+# SECTION 1: PAGE CONFIG & CONSTANTS
+# Kaam: Streamlit dashboard ka layout aur Delta Exchange API settings define karna.
 # ==============================================================================
-BASE_URL = "https://api.india.delta.exchange/v2"  # Delta Exchange India Production URL
-UNDERLYING_ASSET = "ETH"  # 'ETH' ya 'BTC' set karein
-EXPIRY_DATE = "14-11-2026"  # Option Expiry Date (Format: DD-MM-YYYY) - Live expiry dalein!
-INTERVAL_SECONDS = 60  # Har 60 seconds (1 minute) me data record hoga
+st.set_page_config(
+    page_title="Delta Exchange 1m Auto Option & Futures Logger",
+    layout="wide",
+)
 
-# Request headers (Document ke hisab se User-Agent bhejna zaroori hai taaki 403 error na aaye)
-HEADERS = {"Accept": "application/json", "User-Agent": "python-delta-recorder"}
+BASE_URL = "https://api.india.delta.exchange/v2"
+HEADERS = {"Accept": "application/json", "User-Agent": "python-delta-streamlit"}
+IST = timezone(timedelta(hours=5, minutes=30))  # Indian Standard Time
 
 
 # ==============================================================================
-# SECTION 2: DATA FETCHING FUNCTIONS (REST API)
-# Kaam: Delta Exchange ke public /v2/tickers endpoint se Option Chain aur Futures ka data lana.
+# SECTION 2: GOOGLE SHEETS CONNECTION (USING SPREADSHEET ID)
+# Kaam: Streamlit Secrets se Service Account credentials lekar Google Sheet connect karna.
+#       open_by_key() use kiya gaya hai taaki Google Drive API 403 error na aaye.
 # ==============================================================================
+@st.cache_resource
+def get_google_sheet():
+    creds_dict = dict(st.secrets["gcp_service_account"])
+    gc = gspread.service_account_from_dict(creds_dict)
+    sheet_id = st.secrets["SPREADSHEET_ID"]
+    return gc.open_by_key(sheet_id)
+
+
+def get_or_create_worksheet(spreadsheet, title: str, headers: list):
+    """Agar worksheet exist nahi karti to banata hai aur header row add karta hai."""
+    try:
+        ws = spreadsheet.worksheet(title)
+    except gspread.WorksheetNotFound:
+        ws = spreadsheet.add_worksheet(title=title, rows=2000, cols=len(headers))
+        ws.append_row(headers, value_input_option="USER_ENTERED")
+    return ws
+
+
+# ==============================================================================
+# SECTION 3: AUTO-EXPIRY DETECTOR & DELTA EXCHANGE API FETCHERS
+# Kaam:
+#   1. fetch_available_expiries(): Live active options ki sabhi future expiry dates
+#      nikal kar chronological order me sort karta hai (nearest expiry sabse upar).
+#   2. fetch_option_chain() & fetch_futures_data(): Live market data fetch karte hain.
+# ==============================================================================
+def fetch_available_expiries(asset: str) -> list:
+    """Delta Exchange se live call/put options ki sabhi upcoming expiry dates (DD-MM-YYYY) lata hai."""
+    url = f"{BASE_URL}/products"
+    params = {
+        "contract_types": "call_options",
+        "states": "live",
+        "page_size": 500,
+    }
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        if not data.get("success"):
+            return []
+
+        expiries_dt = set()
+        now_utc = datetime.now(timezone.utc)
+
+        for prod in data.get("result", []):
+            # Symbol format: C-ETH-3200-141126 (DDMMYY at the end)
+            sym = prod.get("symbol", "")
+            parts = sym.split("-")
+            if len(parts) == 4 and parts[1] == asset:
+                # settlement_time ISO format se exact expiry date nikalna
+                settle_str = prod.get("settlement_time")
+                if settle_str:
+                    dt = datetime.fromisoformat(
+                        settle_str.replace("Z", "+00:00")
+                    )
+                    if dt > now_utc:
+                        expiries_dt.add(dt.date())
+
+        sorted_dates = sorted(list(expiries_dt))
+        return [d.strftime("%d-%m-%Y") for d in sorted_dates]
+    except Exception as e:
+        print(f"[Expiry Fetch Error]: {e}")
+        return []
+
+
 def fetch_option_chain(asset: str, expiry: str) -> list:
-    """Diye gaye asset aur expiry ke sabhi Call aur Put options ka live ticker data lata hai."""
     url = f"{BASE_URL}/tickers"
     params = {
         "contract_types": "call_options,put_options",
@@ -32,77 +97,63 @@ def fetch_option_chain(asset: str, expiry: str) -> list:
         "expiry_date": expiry,
     }
     try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("success"):
-            return data.get("result", [])
-        else:
-            print(f"[API Error - Options]: {data}")
-            return []
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("result", []) if data.get("success") else []
     except Exception as e:
-        print(f"[Network Error - Options]: {e}")
+        print(f"[Option API Error]: {e}")
         return []
 
 
 def fetch_futures_data(asset: str) -> list:
-    """Diye gaye asset ke Perpetual aur Dated Futures ka live ticker data lata hai."""
     url = f"{BASE_URL}/tickers"
     params = {
         "contract_types": "perpetual_futures,futures",
         "underlying_asset_symbols": asset,
     }
     try:
-        response = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        response.raise_for_status()
-        data = response.json()
-        if data.get("success"):
-            return data.get("result", [])
-        else:
-            print(f"[API Error - Futures]: {data}")
-            return []
+        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
+        r.raise_for_status()
+        data = r.json()
+        return data.get("result", []) if data.get("success") else []
     except Exception as e:
-        print(f"[Network Error - Futures]: {e}")
+        print(f"[Futures API Error]: {e}")
         return []
 
 
 # ==============================================================================
-# SECTION 3: DATA PARSING & CLEANING
-# Kaam: API se aaye raw JSON data me se zaroori fields (Market price, Bid/Ask, Volume, OI, Greeks)
-#       nikal kar ek clean tabular format (list of dictionaries) me convert karna.
+# SECTION 4: DATA PARSING & DAILY ANALYSIS CALCULATOR
+# Kaam: Raw JSON ko clean rows me convert karna aur PCR, Support, Resistance nikalna.
 # ==============================================================================
-def parse_ticker_records(
-    raw_list: list, record_time: str, is_option: bool = True
-) -> list:
-    parsed_rows = []
+def parse_records(raw_list: list, timestamp_str: str, is_option: bool) -> list:
+    rows = []
     for item in raw_list:
         quotes = item.get("quotes") or {}
         greeks = item.get("greeks") or {}
 
-        row = {
-            "Timestamp": record_time,
+        base_row = {
+            "Timestamp_IST": timestamp_str,
             "Symbol": item.get("symbol"),
             "Contract_Type": item.get("contract_type"),
             "Strike_Price": (
-                float(item.get("strike_price") or 0) if is_option else None
+                float(item.get("strike_price") or 0) if is_option else 0
             ),
             "Spot_Price": float(item.get("spot_price") or 0),
-            "Market_Price (Mark)": float(item.get("mark_price") or 0),
-            "Last_Traded_Price (Close)": float(item.get("close") or 0),
-            "Best_Bid (Buy_Price)": float(quotes.get("best_bid") or 0),
+            "Market_Price": float(item.get("mark_price") or 0),
+            "LTP_Close": float(item.get("close") or 0),
+            "Best_Bid": float(quotes.get("best_bid") or 0),
             "Bid_Size": float(quotes.get("bid_size") or 0),
-            "Best_Ask (Ask_Price)": float(quotes.get("best_ask") or 0),
+            "Best_Ask": float(quotes.get("best_ask") or 0),
             "Ask_Size": float(quotes.get("ask_size") or 0),
             "Volume": float(item.get("volume") or 0),
             "Turnover_USD": float(item.get("turnover_usd") or 0),
-            "Open_Interest (OI)": float(item.get("oi") or 0),
+            "OI": float(item.get("oi") or 0),
             "OI_Value_USD": float(item.get("oi_value_usd") or 0),
-            "24h_Change_%": float(item.get("ltp_change_24h") or 0),
         }
 
-        # Options ke liye extra IV aur Greeks add karna
         if is_option:
-            row.update({
+            base_row.update({
                 "Bid_IV": float(quotes.get("bid_iv") or 0),
                 "Ask_IV": float(quotes.get("ask_iv") or 0),
                 "Mark_IV": float(item.get("mark_vol") or 0),
@@ -112,214 +163,175 @@ def parse_ticker_records(
                 "Vega": float(greeks.get("vega") or 0),
             })
         else:
-            # Futures ke liye High/Low add karna
-            row.update({
-                "24h_High": float(item.get("high") or 0),
-                "24h_Low": float(item.get("low") or 0),
+            base_row.update({
+                "High_24h": float(item.get("high") or 0),
+                "Low_24h": float(item.get("low") or 0),
+                "Change_24h_%": float(item.get("ltp_change_24h") or 0),
             })
+        rows.append(base_row)
 
-        parsed_rows.append(row)
-
-    # Options ko Strike Price ke ascending order me sort karna
-    if is_option and parsed_rows:
-        parsed_rows.sort(
-            key=lambda x: (x["Strike_Price"], x["Contract_Type"])
-        )
-
-    return parsed_rows
+    if is_option and rows:
+        rows.sort(key=lambda x: (x["Strike_Price"], x["Contract_Type"]))
+    return rows
 
 
-# ==============================================================================
-# SECTION 4: DAILY ANALYSIS GENERATOR
-# Kaam: Har 1 minute ke option snapshot se PCR (Put-Call Ratio), Max Call OI (Resistance),
-#       Max Put OI (Support), aur Total Call/Put Volume calculate karna.
-# ==============================================================================
-def generate_analysis_summary(
-    df_options: pd.DataFrame, df_futures: pd.DataFrame, record_time: str
-) -> pd.DataFrame:
-    if df_options.empty:
-        return pd.DataFrame()
+def build_analysis_row(
+    df_opt: pd.DataFrame, df_fut: pd.DataFrame, timestamp_str: str, expiry: str
+) -> dict:
+    calls = df_opt[df_opt["Contract_Type"] == "call_options"]
+    puts = df_opt[df_opt["Contract_Type"] == "put_options"]
 
-    calls = df_options[df_options["Contract_Type"] == "call_options"]
-    puts = df_options[df_options["Contract_Type"] == "put_options"]
+    call_oi = float(calls["OI"].sum())
+    put_oi = float(puts["OI"].sum())
+    pcr_oi = round(put_oi / call_oi, 4) if call_oi > 0 else 0
 
-    total_call_oi = calls["Open_Interest (OI)"].sum()
-    total_put_oi = puts["Open_Interest (OI)"].sum()
-    pcr_oi = round(total_put_oi / total_call_oi, 4) if total_call_oi > 0 else 0
+    call_vol = float(calls["Volume"].sum())
+    put_vol = float(puts["Volume"].sum())
+    pcr_vol = round(put_vol / call_vol, 4) if call_vol > 0 else 0
 
-    total_call_vol = calls["Volume"].sum()
-    total_put_vol = puts["Volume"].sum()
-    pcr_vol = (
-        round(total_put_vol / total_call_vol, 4) if total_call_vol > 0 else 0
-    )
-
-    # Highest OI wale strikes (Support & Resistance levels)
-    max_call_oi_strike = (
-        calls.loc[calls["Open_Interest (OI)"].idxmax(), "Strike_Price"]
+    res_strike = (
+        float(calls.loc[calls["OI"].idxmax(), "Strike_Price"])
         if not calls.empty
         else 0
     )
-    max_put_oi_strike = (
-        puts.loc[puts["Open_Interest (OI)"].idxmax(), "Strike_Price"]
+    sup_strike = (
+        float(puts.loc[puts["OI"].idxmax(), "Strike_Price"])
         if not puts.empty
         else 0
     )
+    spot = float(df_opt["Spot_Price"].iloc[0]) if not df_opt.empty else 0
 
-    spot_price = df_options["Spot_Price"].iloc[0]
+    perp = df_fut[df_fut["Contract_Type"] == "perpetual_futures"]
+    fut_price = float(perp["Market_Price"].iloc[0]) if not perp.empty else 0
+    fut_vol = float(perp["Volume"].iloc[0]) if not perp.empty else 0
 
-    # Perpetual Futures ka mark price aur volume nikalna
-    perp_fut = df_futures[df_futures["Contract_Type"] == "perpetual_futures"]
-    fut_price = (
-        perp_fut["Market_Price (Mark)"].iloc[0] if not perp_fut.empty else 0
-    )
-    fut_vol = perp_fut["Volume"].iloc[0] if not perp_fut.empty else 0
-
-    # Market Sentiment signal
     sentiment = (
         "Bullish"
         if pcr_oi > 1.1
-        else ("Bearish" if pcr_oi < 0.8 else "Sideways / Neutral")
+        else ("Bearish" if pcr_oi < 0.8 else "Sideways")
     )
 
-    summary_row = {
-        "Timestamp": record_time,
-        "Spot_Price": spot_price,
+    return {
+        "Timestamp_IST": timestamp_str,
+        "Active_Expiry": expiry,
+        "Spot_Price": spot,
         "Perp_Futures_Price": fut_price,
         "Perp_Futures_Volume": fut_vol,
-        "Total_Call_OI": total_call_oi,
-        "Total_Put_OI": total_put_oi,
-        "PCR (OI_Based)": pcr_oi,
-        "Total_Call_Volume": total_call_vol,
-        "Total_Put_Volume": total_put_vol,
-        "PCR (Volume_Based)": pcr_vol,
-        "Resistance (Max_Call_OI_Strike)": max_call_oi_strike,
-        "Support (Max_Put_OI_Strike)": max_put_oi_strike,
-        "Market_Sentiment": sentiment,
+        "Total_Call_OI": call_oi,
+        "Total_Put_OI": put_oi,
+        "PCR_OI": pcr_oi,
+        "Total_Call_Volume": call_vol,
+        "Total_Put_Volume": put_vol,
+        "PCR_Volume": pcr_vol,
+        "Resistance_Max_Call_OI": res_strike,
+        "Support_Max_Put_OI": sup_strike,
+        "Sentiment": sentiment,
     }
-    return pd.DataFrame([summary_row])
 
 
 # ==============================================================================
-# SECTION 5: EXCEL STORAGE & FORMATTING
-# Kaam: Data ko daily Excel file me 3 alag-alag tabs (Daily_Analysis, Option_Chain_1m,
-#       Futures_1m) me append karna aur header styling apply karna.
+# SECTION 5: AUTO-START BACKGROUND WORKER THREAD
+# Kaam: App boot hote hi apne aap nearest expiry detect karke har 60 seconds me
+#       Google Sheet me data append karta rehta hai. Agar purani expiry expire ho
+#       jaye to automatically next nearest expiry par switch kar leta hai.
 # ==============================================================================
-def append_df_to_excel(file_path: str, sheet_name: str, df: pd.DataFrame):
-    if df.empty:
-        return
+class BackgroundRecorder:
 
-    if not os.path.exists(file_path):
-        with pd.ExcelWriter(file_path, engine="openpyxl") as writer:
-            df.to_excel(writer, sheet_name=sheet_name, index=False)
-        style_excel_sheet(file_path, sheet_name)
-    else:
-        wb = openpyxl.load_workbook(file_path)
-        if sheet_name not in wb.sheetnames:
-            wb.close()
-            with pd.ExcelWriter(
-                file_path, engine="openpyxl", mode="a"
-            ) as writer:
-                df.to_excel(writer, sheet_name=sheet_name, index=False)
-            style_excel_sheet(file_path, sheet_name)
+    def __init__(self):
+        self.running = False
+        self.asset = "ETH"
+        self.auto_expiry_mode = True
+        self.available_expiries = fetch_available_expiries(self.asset)
+        self.expiry = (
+            self.available_expiries[0]
+            if self.available_expiries
+            else "14-11-2026"
+        )
+        self.last_run = "Initializing..."
+        self.last_status = "Auto-starting on boot..."
+        self.latest_analysis = {}
+        self.latest_options_df = pd.DataFrame()
+        self.latest_futures_df = pd.DataFrame()
+        self.thread = None
+
+    def start(self, asset: str, expiry: str, auto_mode: bool = True):
+        self.asset = asset
+        self.auto_expiry_mode = auto_mode
+        if auto_mode:
+            fresh_expiries = fetch_available_expiries(asset)
+            if fresh_expiries:
+                self.available_expiries = fresh_expiries
+                self.expiry = fresh_expiries[0]
         else:
-            ws = wb[sheet_name]
-            for row in df.itertuples(index=False, name=None):
-                ws.append(list(row))
-            wb.save(file_path)
-            wb.close()
+            self.expiry = expiry
 
+        if not self.running:
+            self.running = True
+            self.thread = threading.Thread(target=self._loop, daemon=True)
+            self.thread.start()
 
-def style_excel_sheet(file_path: str, sheet_name: str):
-    """Nayi sheet banne par headers ko dark color, bold white font aur auto column width deta hai."""
-    wb = openpyxl.load_workbook(file_path)
-    ws = wb[sheet_name]
+    def stop(self):
+        self.running = False
+        self.last_status = "Manually paused by user"
 
-    header_fill = PatternFill(
-        start_color="1F4E78", end_color="1F4E78", fill_type="solid"
-    )
-    header_font = Font(color="FFFFFF", bold=True)
+    def _loop(self):
+        spreadsheet = get_google_sheet()
+        while self.running:
+            start_dt = datetime.now(IST)
+            ts_str = start_dt.strftime("%Y-%m-%d %H:%M:%S")
+            date_tag = start_dt.strftime("%Y-%m-%d")
 
-    for cell in ws[1]:
-        cell.fill = header_fill
-        cell.font = header_font
-        cell.alignment = Alignment(horizontal="center")
+            try:
+                # Agar Auto-Expiry ON hai to har cycle me verify karein ki nearest expiry active hai
+                if self.auto_expiry_mode:
+                    fresh_expiries = fetch_available_expiries(self.asset)
+                    if fresh_expiries:
+                        self.available_expiries = fresh_expiries
+                        self.expiry = fresh_expiries[0]
 
-    # Auto-fit column widths
-    for col in ws.columns:
-        max_len = max(len(str(cell.value or "")) for cell in col)
-        ws.column_dimensions[col[0].column_letter].width = max_len + 4
+                raw_opt = fetch_option_chain(self.asset, self.expiry)
+                raw_fut = fetch_futures_data(self.asset)
 
-    ws.freeze_panes = "A2"  # Top header row ko freeze karein
-    wb.save(file_path)
-    wb.close()
+                opt_rows = parse_records(raw_opt, ts_str, is_option=True)
+                fut_rows = parse_records(raw_fut, ts_str, is_option=False)
 
+                df_opt = pd.DataFrame(opt_rows)
+                df_fut = pd.DataFrame(fut_rows)
 
-# ==============================================================================
-# SECTION 6: MAIN EXECUTION LOOP (1-MINUTE SCHEDULER)
-# Kaam: Har minute ke start par exact time sync karke data fetch aur save karna.
-# ==============================================================================
-def run_recorder():
-    print(f"=== Delta Exchange 1-Minute Recorder Started ===")
-    print(
-        f"Asset: {UNDERLYING_ASSET} | Expiry: {EXPIRY_DATE} | Interval: {INTERVAL_SECONDS}s\n"
-    )
+                # 1. Option Chain Tab (Date-wise)
+                if not df_opt.empty:
+                    opt_tab = f"{self.asset}_Options_{date_tag}"
+                    ws_opt = get_or_create_worksheet(
+                        spreadsheet, opt_tab, list(df_opt.columns)
+                    )
+                    ws_opt.append_rows(
+                        df_opt.values.tolist(), value_input_option="USER_ENTERED"
+                    )
 
-    while True:
-        now = datetime.now()
-        current_time_str = now.strftime("%Y-%m-%d %H:%M:%S")
-        today_date_str = now.strftime("%Y-%m-%d")
+                # 2. Futures Tab (Date-wise)
+                if not df_fut.empty:
+                    fut_tab = f"{self.asset}_Futures_{date_tag}"
+                    ws_fut = get_or_create_worksheet(
+                        spreadsheet, fut_tab, list(df_fut.columns)
+                    )
+                    ws_fut.append_rows(
+                        df_fut.values.tolist(), value_input_option="USER_ENTERED"
+                    )
 
-        # Har din ke liye nayi Excel file banegi
-        excel_filename = (
-            f"Delta_{UNDERLYING_ASSET}_Data_{today_date_str}.xlsx"
-        )
+                # 3. Daily Analysis Tab
+                if not df_opt.empty:
+                    analysis_dict = build_analysis_row(
+                        df_opt, df_fut, ts_str, self.expiry
+                    )
+                    ws_ana = get_or_create_worksheet(
+                        spreadsheet, "Daily_Analysis", list(analysis_dict.keys())
+                    )
+                    ws_ana.append_row(
+                        list(analysis_dict.values()),
+                        value_input_option="USER_ENTERED",
+                    )
+                    self.latest_analysis = analysis_dict
 
-        print(f"[{current_time_str}] Fetching Option Chain & Futures data...")
-
-        # 1. API se data fetch karein
-        raw_options = fetch_option_chain(UNDERLYING_ASSET, EXPIRY_DATE)
-        raw_futures = fetch_futures_data(UNDERLYING_ASSET)
-
-        # 2. Data ko clean aur parse karein
-        option_rows = parse_ticker_records(
-            raw_options, current_time_str, is_option=True
-        )
-        futures_rows = parse_ticker_records(
-            raw_futures, current_time_str, is_option=False
-        )
-
-        df_options = pd.DataFrame(option_rows)
-        df_futures = pd.DataFrame(futures_rows)
-
-        # 3. Daily Analysis summary calculate karein
-        df_analysis = generate_analysis_summary(
-            df_options, df_futures, current_time_str
-        )
-
-        # 4. Excel file ke 3 tabs me save karein
-        append_df_to_excel(excel_filename, "Daily_Analysis", df_analysis)
-        append_df_to_excel(excel_filename, "Option_Chain_1m", df_options)
-        append_df_to_excel(excel_filename, "Futures_1m", df_futures)
-
-        print(
-            f"   -> Saved {len(df_options)} Options & {len(df_futures)} Futures rows to '{excel_filename}'"
-        )
-        if not df_analysis.empty:
-            pcr = df_analysis["PCR (OI_Based)"].iloc[0]
-            sup = df_analysis["Support (Max_Put_OI_Strike)"].iloc[0]
-            res = df_analysis["Resistance (Max_Call_OI_Strike)"].iloc[0]
-            print(
-                f"   -> Live Snapshot | Spot: {df_analysis['Spot_Price'].iloc[0]} | PCR: {pcr} | Support: {sup} | Resistance: {res}\n"
-            )
-
-        # Agle exact minute tak wait karein (drift avoid karne ke liye)
-        elapsed = (datetime.now() - now).total_seconds()
-        sleep_time = max(1, INTERVAL_SECONDS - elapsed)
-        time.sleep(sleep_time)
-
-
-if __name__ == "__main__":
-    try:
-        run_recorder()
-    except KeyboardInterrupt:
-        print("\nRecorder manually stopped by user. All data safely saved!")
+                self.latest_options_df = df_opt
+                self.latest_futures_df = df_fut
+                self.last_run = ts_
