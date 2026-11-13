@@ -11,7 +11,7 @@ import streamlit as st
 # Kaam: Streamlit dashboard ka layout aur Delta Exchange API settings define karna.
 # ==============================================================================
 st.set_page_config(
-    page_title="Delta Exchange 1m Auto Option & Futures Logger",
+    page_title="Delta Exchange 1m Option & Futures Recorder",
     layout="wide",
 )
 
@@ -44,51 +44,9 @@ def get_or_create_worksheet(spreadsheet, title: str, headers: list):
 
 
 # ==============================================================================
-# SECTION 3: AUTO-EXPIRY DETECTOR & DELTA EXCHANGE API FETCHERS
-# Kaam:
-#   1. fetch_available_expiries(): Live active options ki sabhi future expiry dates
-#      nikal kar chronological order me sort karta hai (nearest expiry sabse upar).
-#   2. fetch_option_chain() & fetch_futures_data(): Live market data fetch karte hain.
+# SECTION 3: DELTA EXCHANGE API DATA FETCHERS
+# Kaam: Public /v2/tickers endpoint se Option Chain aur Futures ka live data lana.
 # ==============================================================================
-def fetch_available_expiries(asset: str) -> list:
-    """Delta Exchange se live call/put options ki sabhi upcoming expiry dates (DD-MM-YYYY) lata hai."""
-    url = f"{BASE_URL}/products"
-    params = {
-        "contract_types": "call_options",
-        "states": "live",
-        "page_size": 500,
-    }
-    try:
-        r = requests.get(url, params=params, headers=HEADERS, timeout=10)
-        r.raise_for_status()
-        data = r.json()
-        if not data.get("success"):
-            return []
-
-        expiries_dt = set()
-        now_utc = datetime.now(timezone.utc)
-
-        for prod in data.get("result", []):
-            # Symbol format: C-ETH-3200-141126 (DDMMYY at the end)
-            sym = prod.get("symbol", "")
-            parts = sym.split("-")
-            if len(parts) == 4 and parts[1] == asset:
-                # settlement_time ISO format se exact expiry date nikalna
-                settle_str = prod.get("settlement_time")
-                if settle_str:
-                    dt = datetime.fromisoformat(
-                        settle_str.replace("Z", "+00:00")
-                    )
-                    if dt > now_utc:
-                        expiries_dt.add(dt.date())
-
-        sorted_dates = sorted(list(expiries_dt))
-        return [d.strftime("%d-%m-%Y") for d in sorted_dates]
-    except Exception as e:
-        print(f"[Expiry Fetch Error]: {e}")
-        return []
-
-
 def fetch_option_chain(asset: str, expiry: str) -> list:
     url = f"{BASE_URL}/tickers"
     params = {
@@ -176,7 +134,7 @@ def parse_records(raw_list: list, timestamp_str: str, is_option: bool) -> list:
 
 
 def build_analysis_row(
-    df_opt: pd.DataFrame, df_fut: pd.DataFrame, timestamp_str: str, expiry: str
+    df_opt: pd.DataFrame, df_fut: pd.DataFrame, timestamp_str: str
 ) -> dict:
     calls = df_opt[df_opt["Contract_Type"] == "call_options"]
     puts = df_opt[df_opt["Contract_Type"] == "put_options"]
@@ -213,7 +171,6 @@ def build_analysis_row(
 
     return {
         "Timestamp_IST": timestamp_str,
-        "Active_Expiry": expiry,
         "Spot_Price": spot,
         "Perp_Futures_Price": fut_price,
         "Perp_Futures_Volume": fut_vol,
@@ -230,41 +187,26 @@ def build_analysis_row(
 
 
 # ==============================================================================
-# SECTION 5: AUTO-START BACKGROUND WORKER THREAD
-# Kaam: App boot hote hi apne aap nearest expiry detect karke har 60 seconds me
-#       Google Sheet me data append karta rehta hai. Agar purani expiry expire ho
-#       jaye to automatically next nearest expiry par switch kar leta hai.
+# SECTION 5: BACKGROUND WORKER THREAD (CONTINUOUS 1-MINUTE ENGINE)
+# Kaam: @st.cache_resource ke zariye ek single background thread chalana jo har
+#       60 seconds me data fetch karke batch me Google Sheet me append karega.
 # ==============================================================================
 class BackgroundRecorder:
 
     def __init__(self):
         self.running = False
         self.asset = "ETH"
-        self.auto_expiry_mode = True
-        self.available_expiries = fetch_available_expiries(self.asset)
-        self.expiry = (
-            self.available_expiries[0]
-            if self.available_expiries
-            else "14-11-2026"
-        )
-        self.last_run = "Initializing..."
-        self.last_status = "Auto-starting on boot..."
+        self.expiry = "14-11-2026"
+        self.last_run = "Not started yet"
+        self.last_status = "Idle"
         self.latest_analysis = {}
         self.latest_options_df = pd.DataFrame()
         self.latest_futures_df = pd.DataFrame()
         self.thread = None
 
-    def start(self, asset: str, expiry: str, auto_mode: bool = True):
+    def start(self, asset: str, expiry: str):
         self.asset = asset
-        self.auto_expiry_mode = auto_mode
-        if auto_mode:
-            fresh_expiries = fetch_available_expiries(asset)
-            if fresh_expiries:
-                self.available_expiries = fresh_expiries
-                self.expiry = fresh_expiries[0]
-        else:
-            self.expiry = expiry
-
+        self.expiry = expiry
         if not self.running:
             self.running = True
             self.thread = threading.Thread(target=self._loop, daemon=True)
@@ -272,7 +214,7 @@ class BackgroundRecorder:
 
     def stop(self):
         self.running = False
-        self.last_status = "Manually paused by user"
+        self.last_status = "Stopped by user"
 
     def _loop(self):
         spreadsheet = get_google_sheet()
@@ -282,13 +224,6 @@ class BackgroundRecorder:
             date_tag = start_dt.strftime("%Y-%m-%d")
 
             try:
-                # Agar Auto-Expiry ON hai to har cycle me verify karein ki nearest expiry active hai
-                if self.auto_expiry_mode:
-                    fresh_expiries = fetch_available_expiries(self.asset)
-                    if fresh_expiries:
-                        self.available_expiries = fresh_expiries
-                        self.expiry = fresh_expiries[0]
-
                 raw_opt = fetch_option_chain(self.asset, self.expiry)
                 raw_fut = fetch_futures_data(self.asset)
 
@@ -298,7 +233,7 @@ class BackgroundRecorder:
                 df_opt = pd.DataFrame(opt_rows)
                 df_fut = pd.DataFrame(fut_rows)
 
-                # 1. Option Chain Tab (Date-wise)
+                # 1. Batch Append Option Chain (Date-wise tab taaki sheet heavy na ho)
                 if not df_opt.empty:
                     opt_tab = f"{self.asset}_Options_{date_tag}"
                     ws_opt = get_or_create_worksheet(
@@ -308,7 +243,7 @@ class BackgroundRecorder:
                         df_opt.values.tolist(), value_input_option="USER_ENTERED"
                     )
 
-                # 2. Futures Tab (Date-wise)
+                # 2. Batch Append Futures
                 if not df_fut.empty:
                     fut_tab = f"{self.asset}_Futures_{date_tag}"
                     ws_fut = get_or_create_worksheet(
@@ -318,11 +253,9 @@ class BackgroundRecorder:
                         df_fut.values.tolist(), value_input_option="USER_ENTERED"
                     )
 
-                # 3. Daily Analysis Tab
+                # 3. Daily Analysis Tab Update
                 if not df_opt.empty:
-                    analysis_dict = build_analysis_row(
-                        df_opt, df_fut, ts_str, self.expiry
-                    )
+                    analysis_dict = build_analysis_row(df_opt, df_fut, ts_str)
                     ws_ana = get_or_create_worksheet(
                         spreadsheet, "Daily_Analysis", list(analysis_dict.keys())
                     )
@@ -334,4 +267,85 @@ class BackgroundRecorder:
 
                 self.latest_options_df = df_opt
                 self.latest_futures_df = df_fut
-                self.last_run = ts_
+                self.last_run = ts_str
+                self.last_status = f"Success: Saved {len(df_opt)} Options & {len(df_fut)} Futures"
+
+            except Exception as e:
+                self.last_status = f"Error: {str(e)}"
+
+            # Exact 60-second cycle maintain karna
+            elapsed = (datetime.now(IST) - start_dt).total_seconds()
+            sleep_sec = max(1, 60 - elapsed)
+            for _ in range(int(sleep_sec)):
+                if not self.running:
+                    break
+                time.sleep(1)
+
+
+@st.cache_resource
+def get_recorder():
+    return BackgroundRecorder()
+
+
+# ==============================================================================
+# SECTION 6: STREAMLIT WEB DASHBOARD UI
+# Kaam: Browser se Recorder ko Start/Stop karna, Expiry change karna aur live
+#       PCR, Support/Resistance, Option Chain aur Futures dekhna.
+# ==============================================================================
+recorder = get_recorder()
+
+st.title("📊 Delta Exchange 1-Minute Option Chain & Futures Logger")
+
+with st.sidebar:
+    st.header("⚙️ Recorder Controls")
+    asset_input = st.selectbox(
+        "Underlying Asset", ["ETH", "BTC"], index=0 if recorder.asset == "ETH" else 1
+    )
+    expiry_input = st.text_input(
+        "Expiry Date (DD-MM-YYYY)", value=recorder.expiry
+    )
+
+    col1, col2 = st.columns(2)
+    with col1:
+        if st.button("▶️ Start", use_container_width=True):
+            recorder.start(asset_input, expiry_input)
+            st.rerun()
+    with col2:
+        if st.button("⏹️ Stop", use_container_width=True):
+            recorder.stop()
+            st.rerun()
+
+    if st.button("🔄 Refresh Dashboard", use_container_width=True):
+        st.rerun()
+
+    st.divider()
+    st.write(f"**Status:** {'🟢 Running' if recorder.running else '🔴 Stopped'}")
+    st.write(f"**Last Sync (IST):** {recorder.last_run}")
+    st.caption(recorder.last_status)
+
+# Live Analysis Metrics
+if recorder.latest_analysis:
+    ana = recorder.latest_analysis
+    m1, m2, m3, m4, m5 = st.columns(5)
+    m1.metric("Spot Price", f"${ana['Spot_Price']:,.2f}")
+    m2.metric("Perp Futures", f"${ana['Perp_Futures_Price']:,.2f}")
+    m3.metric("PCR (OI)", f"{ana['PCR_OI']} ({ana['Sentiment']})")
+    m4.metric("Support (Max Put OI)", f"${ana['Support_Max_Put_OI']:,.0f}")
+    m5.metric(
+        "Resistance (Max Call OI)", f"${ana['Resistance_Max_Call_OI']:,.0f}"
+    )
+
+tab1, tab2 = st.tabs(["📈 Live Option Chain Snapshot", "📉 Live Futures Snapshot"])
+with tab1:
+    if not recorder.latest_options_df.empty:
+        st.dataframe(
+            recorder.latest_options_df, use_container_width=True, height=500
+        )
+    else:
+        st.info("Sidebar se 'Start' dabayein ya data aane ka wait karein.")
+
+with tab2:
+    if not recorder.latest_futures_df.empty:
+        st.dataframe(recorder.latest_futures_df, use_container_width=True)
+    else:
+        st.info("Futures data yahan dikhega.")
